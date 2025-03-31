@@ -1,0 +1,7 @@
+flask
+solana
+tweepy
+requests
+textblob
+python-telegram-bot
+asyncio
