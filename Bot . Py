@@ -1,0 +1,175 @@
+import time
+import requests
+from solana.rpc.api import Client
+from solana.keypair import Keypair
+import tweepy
+from typing import Dict, List
+import logging
+from textblob import TextBlob
+import telegram
+from flask import Flask, render_template
+import asyncio
+import threading
+import subprocess
+import os
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+PRIVATE_KEY = os.getenv("PHANTOM_PRIVATE_KEY", "YOUR_PHANTOM_PRIVATE_KEY")
+X_API_KEY = os.getenv("X_API_KEY", "YOUR_X_API_KEY")
+X_API_SECRET = os.getenv("X_API_SECRET", "YOUR_X_API_SECRET")
+X_ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN", "YOUR_X_ACCESS_TOKEN")
+X_ACCESS_SECRET = os.getenv("X_ACCESS_SECRET", "YOUR_X_ACCESS_SECRET")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
+MIN_HYPE_SCORE = 100
+MIN_LIQUIDITY = 5000  # زيادة الحد الأدنى للسيولة لتجنب الاحتيال
+MIN_TOKEN_AGE_DAYS = 3  # الحد الأدنى لعمر العملة لتجنب المشاريع الجديدة المشبوهة
+TARGET_MULTIPLIER = 5.0
+AMOUNT_TO_TRADE = 0.5
+BLACKLIST_API = "https://api.rugcheck.xyz/v1/tokens/blacklist"  # مثال لـAPI قائمة سوداء
+
+solana_client = Client(SOLANA_RPC)
+keypair = Keypair.from_secret_key(bytes.fromhex(PRIVATE_KEY))
+auth = tweepy.OAuthHandler(X_API_KEY, X_API_SECRET)
+auth.set_access_token(X_ACCESS_TOKEN, X_ACCESS_SECRET)
+x_api = tweepy.API(auth, wait_on_rate_limit=True)
+telegram_bot = telegram.Bot(token=TELEGRAM_TOKEN)
+tracked_coins: Dict[str, dict] = {}
+transactions_log = []
+
+app = Flask(__name__)
+
+# جلب معلومات العملة مع تحسينات
+def get_token_info(token_address: str) -> Dict[str, float]:
+    url = f"https://public-api.birdeye.so/public/price?address={token_address}"
+    response = requests.get(url)
+    if response.status_code != 200:
+        return {"price": 0.0, "liquidity": 0.0, "age_days": 0.0}
+    data = response.json()["data"]
+    # محاكاة بيانات السيولة والعمر (يمكن استبدالها بـAPI حقيقي مثل DexScreener)
+    liquidity = float(requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}").json().get("liquidity", {}).get("usd", 0) or 0)
+    age_response = requests.get(f"https://api.solscan.io/token/meta?address={token_address}")
+    age_days = (time.time() - age_response.json().get("data", {}).get("created_at", 0)) / 86400 if age_response.status_code == 200 else 0
+    return {"price": float(data["value"]), "liquidity": liquidity, "age_days": age_days}
+
+# التحقق من الاحتيال في العملة
+def is_safe_token(token_address: str) -> bool:
+    info = get_token_info(token_address)
+    # التحقق من القائمة السوداء
+    blacklist_response = requests.get(BLACKLIST_API)
+    blacklist = blacklist_response.json().get("tokens", []) if blacklist_response.status_code == 200 else []
+    if token_address in blacklist:
+        logger.warning(f"Token {token_address} is blacklisted!")
+        return False
+    # شروط الأمان
+    return (info["price"] > 0.0 and 
+            info["liquidity"] >= MIN_LIQUIDITY and 
+            info["age_days"] >= MIN_TOKEN_AGE_DAYS)
+
+# التحقق من المستخدم المحتال
+def is_scammer(tweet) -> bool:
+    user = tweet.user
+    # شروط بسيطة للكشف عن المحتالين
+    if (user.followers_count < 100 or 
+        user.statuses_count < 50 or 
+        "scam" in user.description.lower() or 
+        user.verified is False):
+        logger.warning(f"User {user.screen_name} flagged as potential scammer!")
+        return True
+    return False
+
+# تحليل الضجة على X مع منع الاحتيال
+def analyze_x_hype() -> List[Dict[str, any]]:
+    search_terms = ["meme coin", "new coin", "solana coin", "5x", "pump"]
+    hype_coins = []
+    for term in search_terms:
+        tweets = x_api.search_tweets(q=term, lang="en", count=100, result_type="mixed")
+        for tweet in tweets:
+            if is_scammer(tweet):  # تجاهل التغريدات من المحتالين
+                continue
+            text = tweet.text.lower()
+            if "solana" in text or "meme" in text:
+                potential_address = extract_token_address(text)
+                if potential_address and len(potential_address) == 44:
+                    score = tweet.retweet_count + tweet.favorite_count
+                    sentiment = TextBlob(tweet.text).sentiment.polarity
+                    if sentiment > 0 and is_safe_token(potential_address):
+                        hype_coins.append({
+                            "address": potential_address,
+                            "score": score,
+                            "sentiment": sentiment,
+                            "price": get_token_info(potential_address)["price"]
+                        })
+    return sorted(hype_coins, key=lambda x: x["score"], reverse=True)
+
+def extract_token_address(text: str) -> str:
+    words = text.split()
+    for word in words:
+        if len(word) == 44 and word.isalnum():
+            return word
+    return ""
+
+def raydium_swap(token_address: str, amount_in_sol: float, is_buy: bool):
+    action = "buy" if is_buy else "sell"
+    result = subprocess.run([
+        "node", "raydium_swap.js", 
+        token_address, str(amount_in_sol), action, PRIVATE_KEY
+    ], capture_output=True, text=True)
+    return result.stdout
+
+async def buy_token(token_address: str, amount_in_sol: float, entry_price: float):
+    if not is_safe_token(token_address):
+        logger.warning(f"Skipping {token_address}: Not safe!")
+        return
+    tx_result = raydium_swap(token_address, amount_in_sol, True)
+    logger.info(f"Bought {token_address}: {tx_result}")
+    tracked_coins[token_address] = {"entry_price": entry_price, "amount": amount_in_sol}
+    transactions_log.append(f"Bought {token_address} at {entry_price}")
+    await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"Bought {token_address} at {entry_price}")
+
+async def sell_token(token_address: str):
+    if token_address not in tracked_coins:
+        return
+    tx_result = raydium_swap(token_address, tracked_coins[token_address]["amount"], False)
+    logger.info(f"Sold {token_address}: {tx_result}")
+    transactions_log.append(f"Sold {token_address}")
+    await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"Sold {token_address}")
+    del tracked_coins[token_address]
+
+async def trading_strategy():
+    while True:
+        try:
+            hype_coins = analyze_x_hype()
+            logger.info(f"Found {len(hype_coins)} hyped coins")
+            for coin in hype_coins[:5]:
+                address = coin["address"]
+                score = coin["score"]
+                current_price = coin["price"]
+                if score < MIN_HYPE_SCORE or current_price == 0.0:
+                    continue
+                if address not in tracked_coins:
+                    await buy_token(address, AMOUNT_TO_TRADE, current_price)
+                elif tracked_coins.get(address):
+                    entry_price = tracked_coins[address]["entry_price"]
+                    if current_price >= entry_price * TARGET_MULTIPLIER:
+                        await sell_token(address)
+            time.sleep(60)
+        except Exception as e:
+            logger.error(f"Error: {str(e)}")
+            time.sleep(60)
+
+@app.route('/')
+def dashboard():
+    return render_template('dashboard.html', coins=tracked_coins, transactions=transactions_log)
+
+def run_bot():
+    asyncio.run(trading_strategy())
+
+if __name__ == "__main__":
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.daemon = True
+    bot_thread.start()
+    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 5000)))
