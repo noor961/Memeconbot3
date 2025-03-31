@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Meme Coin Hunter</title>
+    <style>
+        body { font-family: Arial; margin: 20px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { border: 1px solid #ddd; padding: 8px; }
+        th { background: #f2f2f2; }
+    </style>
+</head>
+<body>
+    <h1>Meme Coin Hunter</h1>
+    <h2>Tracked Coins</h2>
+    <table>
+        <tr><th>Token</th><th>Entry Price</th><th>Amount (SOL)</th></tr>
+        {% for address, data in coins.items() %}
+        <tr><td>{{ address }}</td><td>{{ data.entry_price }}</td><td>{{ data.amount }}</td></tr>
+        {% endfor %}
+    </table>
+    <h2>Transactions</h2>
+    <table>
+        <tr><th>Transaction</th></tr>
+        {% for tx in transactions %}
+        <tr><td>{{ tx }}</td></tr>
+        {% endfor %}
+    </table>
+</body>
+</html>
