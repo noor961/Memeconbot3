@@ -1,0 +1,8 @@
+const { Telegraf } = require('telegraf');
+
+const bot = new Telegraf(process.env.TELEGRAM_TOKEN);
+
+bot.start((ctx) => ctx.reply('Welcome to Meme Coin Bot!'));
+bot.launch();
+
+console.log('Bot is running!');
